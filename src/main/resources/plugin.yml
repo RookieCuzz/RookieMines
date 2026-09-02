@@ -1,0 +1,18 @@
+name: RookieMines
+version: '${project.version}'
+main: dev.rookiemines.RookieMinesPlugin
+api-version: '1.21.4'
+prefix: 菜鸟矿洞
+description: 菜鸟矿洞：每日随机生成的农场 RPG 风格矿洞。
+commands:
+  rmine:
+    description: Enter and manage the procedural mines.
+    usage: /rmine <enter|leave|status|elevator|skull|admin>
+    aliases: [rookiemine]
+permissions:
+  rookiemines.use:
+    description: Use the mine, elevator, and status commands.
+    default: true
+  rookiemines.admin:
+    description: Regenerate floors and control the test day.
+    default: op

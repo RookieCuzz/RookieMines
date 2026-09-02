@@ -1,0 +1,49 @@
+name: Bug 报告
+description: 报告可复现的插件错误或兼容问题
+title: '[Bug] '
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: 请先确认你正在使用 Paper 1.21.4 与 Java 21，并移除无关插件复现一次。
+
+  - type: input
+    id: plugin-version
+    attributes:
+      label: RookieMines 版本
+      placeholder: 例如 1.0.0-SNAPSHOT 或 Git commit
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: 服务端环境
+      placeholder: Paper 构建号、Java 版本、操作系统
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 预期行为
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际行为与复现步骤
+      description: 请提供命令、楼层、游戏天数或骷髅洞会话，以及最小复现步骤。
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志与相关配置
+      description: 请拖入日志文件；粘贴配置前删除地址、令牌或其他敏感信息。
+      render: shell
+    validations:
+      required: true

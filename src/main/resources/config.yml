@@ -1,0 +1,33 @@
+# Dedicated void world that stores all generated floors.
+world:
+  name: rookie_mines
+  seed: 731992431237
+  source-day-world: world
+  floor-spacing: 160
+  base-y: 40
+
+generation:
+  # Defaults follow the upstream generator's current 80-120 block range.
+  min-size: 80
+  max-size: 120
+  height: 18
+  blocks-per-tick: 18000
+  normal-dark-chance: 0.15
+  skull-dark-chance: 0.30
+  monster-density: 0.0035
+  max-monsters: 24
+  generate-monsters: true
+  fishing-pool-chance: 0.35
+  special-room-chance: 0.28
+
+ladder:
+  base-chance: 0.02
+  no-enemies-bonus: 0.04
+  skull-shaft-chance: 0.20
+
+# -1 uses source-day-world.fullTime / 24000. Admin test commands can override it.
+forced-day: -1
+
+# Enables machine-readable MINE_E2E responses used by the Mineflayer suite.
+# Keep false on production servers.
+test-mode: false

@@ -1,0 +1,64 @@
+name: Paper + Mineflayer E2E
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - pom.xml
+      - src/**
+      - mineflayer/**
+      - scripts/run-e2e.ps1
+      - .github/workflows/e2e.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: paper-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  paper-e2e:
+    name: Paper 1.21.4 real-client regression
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Java 21
+        uses: actions/setup-java@dd06d9cba3e5552c54d9f8ea23572deb30010f7c # v6.0.0
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: mineflayer/package-lock.json
+
+      - name: Restore Paper caches
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            e2e/cache
+            e2e/runtime
+          key: ${{ runner.os }}-paper-1.21.4-232
+
+      - name: Run end-to-end suite
+        shell: pwsh
+        run: .\scripts\run-e2e.ps1
+
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: RookieMines-E2E-failure-${{ github.run_id }}
+          path: e2e/artifacts/**
+          if-no-files-found: warn
+          retention-days: 7
