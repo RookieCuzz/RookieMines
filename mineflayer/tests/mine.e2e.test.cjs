@@ -97,7 +97,7 @@ generation:
   min-size: 32
   max-size: 40
   height: 12
-  blocks-per-tick: 50000
+  blocks-per-tick: 500
   normal-dark-chance: 0.15
   skull-dark-chance: 0.30
   monster-density: 0.0
@@ -105,6 +105,12 @@ generation:
   generate-monsters: false
   fishing-pool-chance: 0.0
   special-room-chance: 0.0
+  floor-variation: 2
+  ceiling-variation: 3
+  wall-roughness: 0.42
+  formation-density: 0.018
+  earth-cobweb-density: 1.0
+  skull-cobweb-density: 1.0
 ladder:
   base-chance: 0.02
   no-enemies-bonus: 0.04
@@ -156,6 +162,23 @@ function waitForBotSpawn (bot) {
     bot.once('kicked', reason => reject(new Error(`Bot kicked: ${String(reason)}`)))
     bot.once('error', reject)
   }), 30000, 'Mineflayer spawn')
+}
+
+function waitForWindowOpen (bot, label) {
+  return withTimeout(new Promise(resolve => {
+    bot.once('windowOpen', resolve)
+  }), 10000, `window open: ${label}`)
+}
+
+function waitForWindowClose (bot, expectedWindow, label) {
+  return withTimeout(new Promise(resolve => {
+    const listener = closedWindow => {
+      if (closedWindow?.id !== expectedWindow.id) return
+      bot.off('windowClose', listener)
+      resolve(closedWindow)
+    }
+    bot.on('windowClose', listener)
+  }), 10000, `window close: ${label}`)
 }
 
 function commandJson (bot, command, id) {
@@ -232,6 +255,45 @@ async function waitForNearbyBlock (bot, name, maxDistance) {
     await delay(100)
   }
   throw new Error(`Nearby block never became visible: ${name}`)
+}
+
+function scanCaveRelief (bot, centerX, centerZ, baseY, height, radius) {
+  const floorLevels = new Set()
+  const ceilingLevels = new Set()
+  let samples = 0
+  const isFullBlock = block => block != null && block.boundingBox === 'block'
+  for (let dx = -radius; dx <= radius; dx++) {
+    for (let dz = -radius; dz <= radius; dz++) {
+      if (dx * dx + dz * dz <= 8 * 8) continue
+      const x = centerX + dx
+      const z = centerZ + dz
+      for (let y = baseY + 1; y <= baseY + height - 5; y++) {
+        const support = bot.blockAt(new Vec3(x, y, z))
+        const feet = bot.blockAt(new Vec3(x, y + 1, z))
+        const head = bot.blockAt(new Vec3(x, y + 2, z))
+        const above = bot.blockAt(new Vec3(x, y + 3, z))
+        if (!isFullBlock(support) || isFullBlock(feet) || isFullBlock(head) || isFullBlock(above)) continue
+
+        let ceilingY
+        for (let candidateY = y + 4; candidateY < baseY + height; candidateY++) {
+          if (isFullBlock(bot.blockAt(new Vec3(x, candidateY, z)))) {
+            ceilingY = candidateY
+            break
+          }
+        }
+        if (ceilingY == null) break
+        floorLevels.add(y - baseY)
+        ceilingLevels.add(ceilingY - baseY)
+        samples++
+        break
+      }
+    }
+  }
+  return {
+    samples,
+    floorLevels: [...floorLevels].sort((a, b) => a - b),
+    ceilingLevels: [...ceilingLevels].sort((a, b) => a - b)
+  }
 }
 
 async function stopServer (server) {
@@ -325,11 +387,41 @@ test('Paper 1.21.4 procedural mines work through a real Mineflayer client', { ti
     assert.match(first.layoutHash, /^[0-9a-f]{16}$/)
     assert.ok(Math.abs(bot.entity.position.z - 64) < 8, 'bot arrived near floor 1 center')
 
+    const firstMenuOpened = waitForWindowOpen(bot, 'floor 1 elevator')
+    bot.chat('/rmine elevator')
+    const firstMenu = await firstMenuOpened
+    assert.equal(firstMenu.inventoryStart, 45, 'elevator uses a 45-slot top inventory')
+    assert.equal(firstMenu.slots[10]?.name, 'minecart', 'floor 1 is shown as the current destination')
+    assert.equal(firstMenu.slots[11]?.name, 'gray_stained_glass_pane', 'floor 5 starts locked')
+    await bot.clickWindow(11, 0, 0)
+    await delay(250)
+    assert.equal(bot.currentWindow?.id, firstMenu.id, 'clicking a locked floor keeps the menu open')
+    const lockedStatusId = `locked_gui_${Date.now()}`
+    const lockedStatus = await commandJson(bot, `/rmine status ${lockedStatusId}`, lockedStatusId)
+    assert.equal(lockedStatus.floor, 1, 'clicking a locked floor does not teleport')
+    const firstMenuClosed = waitForWindowClose(bot, firstMenu, 'close button')
+    await bot.clickWindow(44, 0, 0)
+    await firstMenuClosed
+
+    const relief = scanCaveRelief(
+      bot,
+      Math.floor(bot.entity.position.x),
+      Math.floor(bot.entity.position.z),
+      40,
+      12,
+      18
+    )
+    assert.ok(relief.samples >= 50, 'Mineflayer sees enough standable cave columns')
+    assert.ok(relief.floorLevels.length >= 2, 'Mineflayer sees multiple floor elevations')
+    assert.ok(relief.ceilingLevels.length >= 2, 'Mineflayer sees multiple ceiling elevations')
+
     const visibleRock = bot.findBlock({
       matching: block => block != null && ['stone', 'copper_ore', 'coal_ore', 'amethyst_block'].includes(block.name),
       maxDistance: 30
     })
     assert.ok(visibleRock, 'Mineflayer can independently see a generated earth-theme block')
+    const earthCobweb = await waitForNearbyBlock(bot, 'cobweb', 32)
+    assert.equal(earthCobweb.name, 'cobweb', 'Mineflayer sees generated wall cobweb decoration')
 
     bot.chat(`/give ${BOT_NAME} minecraft:diamond_pickaxe 1`)
     await waitForInventoryItem(bot, 'diamond_pickaxe')
@@ -360,7 +452,14 @@ test('Paper 1.21.4 procedural mines work through a real Mineflayer client', { ti
     bot.chat('/rmine admin day 1002')
     await delay(100)
     bot.chat('/rmine admin goto 1')
-    const nextDay = await waitForFloor(bot, 1, status => status.day === 1002)
+    await delay(150)
+    // Keep sending through the dimension change so at least one update lands
+    // while the deliberately throttled floor build is still in progress.
+    for (let attempt = 0; attempt < 4; attempt++) {
+      bot.chat('/rmine admin day 1003')
+      await delay(150)
+    }
+    const nextDay = await waitForFloor(bot, 1, status => status.day === 1003)
     assert.notEqual(nextDay.layoutHash, first.layoutHash)
     assert.equal(nextDay.generationCount, 2)
     assert.equal(nextDay.ladder, false)
@@ -375,6 +474,27 @@ test('Paper 1.21.4 procedural mines work through a real Mineflayer client', { ti
     await bot.activateBlock(rewardChest)
     await waitForInventoryItem(bot, 'trial_key')
 
+    const completeMenuOpened = waitForWindowOpen(bot, 'fully unlocked elevator')
+    bot.chat('/rmine elevator')
+    const completeMenu = await completeMenuOpened
+    const destinationSlots = [
+      10, 11, 12, 13, 14, 15, 16,
+      19, 20, 21, 22, 23, 24, 25,
+      28, 29, 30, 31, 32, 33, 34,
+      37, 38, 39, 40
+    ]
+    for (const slot of destinationSlots) {
+      assert.ok(completeMenu.slots[slot], `destination slot ${slot} is populated`)
+      assert.notEqual(completeMenu.slots[slot].name, 'gray_stained_glass_pane', `destination slot ${slot} is unlocked`)
+    }
+    assert.equal(completeMenu.slots[40]?.name, 'minecart', 'floor 120 is shown as current')
+    assert.equal(completeMenu.slots[14]?.name, 'copper_ore', 'slot 14 selects unlocked floor 20')
+    const completeMenuClosed = waitForWindowClose(bot, completeMenu, 'floor 20 selection')
+    await bot.clickWindow(14, 0, 0)
+    await completeMenuClosed
+    const elevatorFloor = await waitForFloor(bot, 20)
+    assert.equal(elevatorFloor.theme, 'EARTH', 'GUI click travels to the selected unlocked floor')
+
     bot.chat('/rmine leave')
     await delay(300)
     bot.chat('/rmine skull')
@@ -384,6 +504,8 @@ test('Paper 1.21.4 procedural mines work through a real Mineflayer client', { ti
     bot.chat('/rmine admin goto 122')
     const skullFirst = await waitForFloor(bot, 122)
     assert.equal(skullFirst.theme, 'SKULL')
+    const skullCobweb = await waitForNearbyBlock(bot, 'cobweb', 32)
+    assert.equal(skullCobweb.name, 'cobweb', 'Skull Cavern generates denser cobweb decoration')
     bot.chat('/rmine leave')
     await delay(500)
     bot.chat('/rmine admin goto 122')
@@ -403,6 +525,7 @@ test('Paper 1.21.4 procedural mines work through a real Mineflayer client', { ti
       paper: '1.21.4-232',
       mineflayer: require('mineflayer/package.json').version,
       firstLayout: first.layoutHash,
+      firstRelief: relief,
       nextDayLayout: nextDay.layoutHash,
       skullSessionSeed1: skullFirst.seed,
       skullSessionSeed2: skullSecond.seed,

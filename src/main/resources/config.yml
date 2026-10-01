@@ -19,6 +19,18 @@ generation:
   generate-monsters: true
   fishing-pool-chance: 0.35
   special-room-chance: 0.28
+  # Natural cave shaping. Set all four values to 0 for a flat, unroughened profile.
+  # This does not restore layouts created by older plugin versions.
+  # Variations are block counts. Roughness is a 0.0-1.0 probability;
+  # formation density is a 0.0-1.0 target share (capped at 140 formations per floor).
+  floor-variation: 2
+  ceiling-variation: 3
+  wall-roughness: 0.42
+  formation-density: 0.018
+  # High wall/ceiling decoration density. Cobwebs keep three clear blocks above paths.
+  # Frost and lava floors intentionally do not generate cobwebs.
+  earth-cobweb-density: 0.0015
+  skull-cobweb-density: 0.008
 
 ladder:
   base-chance: 0.02

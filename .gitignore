@@ -4,6 +4,7 @@ dependency-reduced-pom.xml
 release.properties
 pom.xml.releaseBackup
 hs_err_pid*.log
+javac.*.args
 
 # IDEs
 /.idea/

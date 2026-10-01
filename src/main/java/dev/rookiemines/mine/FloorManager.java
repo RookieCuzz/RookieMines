@@ -25,7 +25,9 @@ import org.bukkit.potion.PotionEffectType;
 import org.bukkit.scheduler.BukkitRunnable;
 import org.bukkit.util.BoundingBox;
 
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -53,10 +55,12 @@ public final class FloorManager {
     private final double noEnemiesBonus;
     private final double shaftChance;
     private final Map<Integer, GenerationJob> jobs = new HashMap<>();
-    private final Map<Integer, Set<UUID>> waitingPlayers = new HashMap<>();
+    private final PendingTargets pendingTargets = new PendingTargets();
+    private final Deque<PreparedPlan> buildQueue = new ArrayDeque<>();
     private final Map<BlockKey, LadderTarget> ladders = new HashMap<>();
     private final Map<BlockKey, Integer> rewardChests = new HashMap<>();
     private final Map<UUID, Location> returnLocations = new HashMap<>();
+    private GenerationJob activeBuilder;
 
     public FloorManager(
             RookieMinesPlugin plugin,
@@ -81,8 +85,14 @@ public final class FloorManager {
     }
 
     private void restoreIndexes() {
+        int removed = 0;
         for (Map.Entry<Integer, FloorState> entry : floorStore.all().entrySet()) {
             FloorState state = entry.getValue();
+            if (!isCurrentDescriptor(state.descriptor())) {
+                floorStore.remove(entry.getKey());
+                removed++;
+                continue;
+            }
             if (state.ladder() != null) {
                 int destination = state.ladderDestination() > 0
                         ? state.ladderDestination()
@@ -94,6 +104,10 @@ public final class FloorManager {
             if (state.rewardChest() != null) {
                 rewardChests.put(BlockKey.of(state.rewardChest()), entry.getKey());
             }
+        }
+        if (removed > 0) {
+            floorStore.save();
+            plugin.getLogger().info("Discarded " + removed + " outdated saved mine floor(s).");
         }
     }
 
@@ -159,31 +173,182 @@ public final class FloorManager {
             return;
         }
         long generationKey = generationKeyFor(floor);
+        FloorDescriptor descriptor = generator.describe(world.getSeed(), generationKey, floor);
         FloorState existing = floorStore.get(floor);
-        if (existing != null
-                && existing.descriptor().generationKey() == generationKey
-                && existing.descriptor().canvasSize() == settings.maxSize()
-                && existing.descriptor().height() == settings.height()) {
+        if (existing != null && existing.descriptor().equals(descriptor)) {
+            pendingTargets.cancel(player.getUniqueId());
             teleportIntoFloor(player, existing.descriptor());
             return;
         }
 
-        waitingPlayers.computeIfAbsent(floor, ignored -> new HashSet<>()).add(player.getUniqueId());
-        if (jobs.containsKey(floor)) {
-            message(player, "Floor " + floor + " is already being generated; you were added to the queue.", NamedTextColor.YELLOW);
+        pendingTargets.replace(player.getUniqueId(), floor);
+        if (!evacuateOutdatedFloor(existing != null ? existing.descriptor() : descriptor)) {
+            cancelUnsafeGeneration(floor);
             return;
         }
-        FloorDescriptor descriptor = generator.describe(world.getSeed(), generationKey, floor);
-        jobs.put(floor, new GenerationJob(descriptor, JobStage.PLANNING));
+        GenerationJob active = jobs.get(floor);
+        if (active != null) {
+            String reason = active.descriptor.equals(descriptor)
+                    ? "is already being generated"
+                    : "changed while it was being generated and will restart";
+            message(player, "Floor " + floor + " " + reason + "; you were added to the queue.", NamedTextColor.YELLOW);
+            return;
+        }
         message(player, "Generating floor " + floor + " (" + descriptor.theme() + ")...", NamedTextColor.YELLOW);
+        startGeneration(descriptor);
+    }
+
+    private void startGeneration(FloorDescriptor descriptor) {
+        int floor = descriptor.floor();
+        GenerationJob job = new GenerationJob(descriptor, JobStage.PLANNING);
+        jobs.put(floor, job);
         Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
             try {
                 FloorPlan plan = generator.generate(descriptor);
-                Bukkit.getScheduler().runTask(plugin, () -> preloadChunks(plan));
+                Bukkit.getScheduler().runTask(plugin, () -> {
+                    if (!restartIfOutdated(job, List.of())) {
+                        queueForBuilding(job, plan);
+                    }
+                });
             } catch (Throwable throwable) {
-                Bukkit.getScheduler().runTask(plugin, () -> failGeneration(floor, throwable));
+                Bukkit.getScheduler().runTask(plugin, () -> {
+                    if (!restartIfOutdated(job, List.of())) {
+                        failGeneration(job, throwable);
+                    }
+                });
             }
         });
+    }
+
+    private boolean restartIfOutdated(GenerationJob job, List<Chunk> chunks) {
+        int floor = job.descriptor.floor();
+        if (jobs.get(floor) != job) {
+            if (activeBuilder == job) {
+                releaseChunkTickets(chunks);
+                releaseBuildSlot(job);
+            }
+            return true;
+        }
+        FloorDescriptor expected = describe(floor);
+        if (job.descriptor.equals(expected)) {
+            return false;
+        }
+
+        jobs.remove(floor, job);
+        releaseChunkTickets(chunks);
+        Set<UUID> queued = pendingTargets.waitingFor(floor);
+        if (queued.isEmpty()) {
+            releaseBuildSlot(job);
+            return true;
+        }
+        for (UUID uuid : queued) {
+            Player player = Bukkit.getPlayer(uuid);
+            if (player != null && player.isOnline()) {
+                message(player, "Mine conditions changed; restarting floor " + floor + " with the current seed.", NamedTextColor.YELLOW);
+            }
+        }
+        plugin.getLogger().info("Restarting outdated floor generation " + floor
+                + " oldSeed=" + job.descriptor.seed() + " newSeed=" + expected.seed());
+        startGeneration(expected);
+        releaseBuildSlot(job);
+        return true;
+    }
+
+    private boolean isCurrentDescriptor(FloorDescriptor descriptor) {
+        return descriptor.equals(describe(descriptor.floor()));
+    }
+
+    private void releaseChunkTickets(List<Chunk> chunks) {
+        for (Chunk chunk : chunks) {
+            chunk.removePluginChunkTicket(plugin);
+        }
+    }
+
+    private void queueForBuilding(GenerationJob job, FloorPlan plan) {
+        if (jobs.get(job.descriptor.floor()) != job) return;
+        job.stage = JobStage.QUEUED;
+        buildQueue.addLast(new PreparedPlan(job, plan));
+        startNextBuild();
+    }
+
+    private void startNextBuild() {
+        if (activeBuilder != null) return;
+        while (!buildQueue.isEmpty()) {
+            PreparedPlan prepared = buildQueue.removeFirst();
+            GenerationJob job = prepared.job();
+            if (jobs.get(job.descriptor.floor()) != job) continue;
+            if (restartIfOutdated(job, List.of())) continue;
+            activeBuilder = job;
+            preloadChunks(job, prepared.plan());
+            return;
+        }
+    }
+
+    private void releaseBuildSlot(GenerationJob job) {
+        if (activeBuilder != job) return;
+        activeBuilder = null;
+        startNextBuild();
+    }
+
+    private boolean evacuateOutdatedFloor(FloorDescriptor descriptor) {
+        boolean allClear = true;
+        for (Player occupant : world.getPlayers()) {
+            Location location = occupant.getLocation();
+            if (!descriptor.contains(location.getBlockX(), location.getBlockY(), location.getBlockZ())) continue;
+            if (evacuateForRegeneration(occupant, descriptor.floor())) {
+                pendingTargets.addIfAbsent(occupant.getUniqueId(), descriptor.floor());
+            } else {
+                allClear = false;
+            }
+        }
+        if (allClear) removeIndexesForFloor(descriptor.floor());
+        return allClear;
+    }
+
+    private boolean evacuateForRegeneration(Player player, int floor) {
+        if (!player.teleport(regenerationHoldingPoint())) {
+            message(player, "Could not move you safely, so floor " + floor + " regeneration was cancelled.", NamedTextColor.RED);
+            plugin.getLogger().warning("Cancelled floor " + floor + " regeneration because "
+                    + player.getName() + " could not be evacuated.");
+            return false;
+        }
+        player.getPersistentDataContainer().remove(floorKey);
+        player.setFallDistance(0.0f);
+        message(player, "Floor " + floor + " is being rebuilt; you will return when it is ready.", NamedTextColor.YELLOW);
+        return true;
+    }
+
+    private void cancelUnsafeGeneration(int floor) {
+        GenerationJob cancelled = jobs.remove(floor);
+        if (cancelled != null) {
+            buildQueue.removeIf(prepared -> prepared.job() == cancelled);
+            if (activeBuilder == cancelled && cancelled.stage == JobStage.LOADING) {
+                // No plugin tickets exist until loading completes, so this slot
+                // can be handed to the next plan without waiting on the future.
+                releaseBuildSlot(cancelled);
+            }
+        }
+        Set<UUID> queued = pendingTargets.completeFloor(floor);
+        for (UUID uuid : queued) {
+            Player queuedPlayer = Bukkit.getPlayer(uuid);
+            if (queuedPlayer != null && queuedPlayer.isOnline()) {
+                message(queuedPlayer, "Floor " + floor + " regeneration was cancelled because an occupant could not be moved safely.", NamedTextColor.RED);
+            }
+        }
+    }
+
+    private Location regenerationHoldingPoint() {
+        String sourceName = plugin.getConfig().getString("world.source-day-world", "world");
+        World holdingWorld = sourceName == null ? null : Bukkit.getWorld(sourceName);
+        if (holdingWorld == null || holdingWorld.equals(world)) {
+            holdingWorld = Bukkit.getWorlds().stream().filter(candidate -> !candidate.equals(world)).findFirst().orElse(null);
+        }
+        if (holdingWorld != null) {
+            return holdingWorld.getSpawnLocation();
+        }
+        Block support = world.getBlockAt(0, settings.baseY(), 0);
+        support.setType(Material.BEDROCK, false);
+        return new Location(world, 0.5, settings.baseY() + 1.0, 0.5);
     }
 
     private boolean canEnter(Player player, int floor) {
@@ -193,9 +358,11 @@ public final class FloorManager {
         return floor % 5 == 0 && floor <= progressStore.deepestElevator(player.getUniqueId());
     }
 
-    private void preloadChunks(FloorPlan plan) {
-        GenerationJob job = jobs.get(plan.descriptor().floor());
-        if (job == null) return;
+    private void preloadChunks(GenerationJob job, FloorPlan plan) {
+        if (jobs.get(plan.descriptor().floor()) != job || activeBuilder != job) {
+            releaseBuildSlot(job);
+            return;
+        }
         job.stage = JobStage.LOADING;
         int minChunkX = Math.floorDiv(plan.descriptor().originX(), 16);
         int maxChunkX = Math.floorDiv(plan.descriptor().originX() + plan.descriptor().canvasSize() - 1, 16);
@@ -209,23 +376,25 @@ public final class FloorManager {
         }
         CompletableFuture.allOf(futures.toArray(CompletableFuture[]::new)).whenComplete((ignored, throwable) ->
                 Bukkit.getScheduler().runTask(plugin, () -> {
+                    if (restartIfOutdated(job, List.of())) {
+                        return;
+                    }
                     if (throwable != null) {
-                        failGeneration(plan.descriptor().floor(), throwable);
+                        failGeneration(job, throwable);
                         return;
                     }
                     List<Chunk> chunks = futures.stream().map(CompletableFuture::join).toList();
                     for (Chunk chunk : chunks) {
                         chunk.addPluginChunkTicket(plugin);
                     }
-                    applyPlan(plan, chunks);
+                    applyPlan(job, plan, chunks);
                 })
         );
     }
 
-    private void applyPlan(FloorPlan plan, List<Chunk> chunks) {
+    private void applyPlan(GenerationJob job, FloorPlan plan, List<Chunk> chunks) {
         int floor = plan.descriptor().floor();
-        GenerationJob job = jobs.get(floor);
-        if (job == null) return;
+        if (restartIfOutdated(job, chunks)) return;
         job.stage = JobStage.BUILDING;
         clearFloorEntities(plan.descriptor());
         removeIndexesForFloor(floor);
@@ -236,6 +405,14 @@ public final class FloorManager {
             @Override
             public void run() {
                 try {
+                    if (activeBuilder != job) {
+                        cancel();
+                        return;
+                    }
+                    if (restartIfOutdated(job, chunks)) {
+                        cancel();
+                        return;
+                    }
                     int changed = 0;
                     long deadline = System.nanoTime() + 8_000_000L;
                     while (index < plan.volume()
@@ -252,20 +429,19 @@ public final class FloorManager {
                     }
                     if (index >= plan.volume()) {
                         cancel();
-                        finishPlan(plan, chunks);
+                        finishPlan(job, plan, chunks);
                     }
                 } catch (Throwable throwable) {
                     cancel();
-                    for (Chunk chunk : chunks) {
-                        chunk.removePluginChunkTicket(plugin);
-                    }
-                    failGeneration(floor, throwable);
+                    releaseChunkTickets(chunks);
+                    failGeneration(job, throwable);
                 }
             }
         }.runTaskTimer(plugin, 1L, 1L);
     }
 
-    private void finishPlan(FloorPlan plan, List<Chunk> chunks) {
+    private void finishPlan(GenerationJob job, FloorPlan plan, List<Chunk> chunks) {
+        if (restartIfOutdated(job, chunks)) return;
         FloorDescriptor descriptor = plan.descriptor();
         FloorState previous = floorStore.get(descriptor.floor());
         int generationCount = previous == null ? 1 : previous.generationCount() + 1;
@@ -303,26 +479,24 @@ public final class FloorManager {
 
         floorStore.put(descriptor.floor(), state);
         floorStore.save();
-        jobs.remove(descriptor.floor());
+        jobs.remove(descriptor.floor(), job);
 
-        Set<UUID> queued = waitingPlayers.remove(descriptor.floor());
-        if (queued != null) {
-            for (UUID uuid : queued) {
-                Player player = Bukkit.getPlayer(uuid);
-                if (player != null && player.isOnline()) {
-                    teleportIntoFloor(player, descriptor);
-                    message(player, "Floor " + descriptor.floor() + " ready: " + descriptor.theme()
-                            + (descriptor.dark() ? " (dark)" : "") + ".", NamedTextColor.GREEN);
-                }
+        Set<UUID> queued = pendingTargets.completeFloor(descriptor.floor());
+        for (UUID uuid : queued) {
+            Player player = Bukkit.getPlayer(uuid);
+            if (player != null && player.isOnline()) {
+                teleportIntoFloor(player, descriptor);
+                message(player, "Floor " + descriptor.floor() + " ready: " + descriptor.theme()
+                        + (descriptor.dark() ? " (dark)" : "") + ".", NamedTextColor.GREEN);
             }
         }
         plugin.getLogger().info("Generated floor " + descriptor.floor() + " seed=" + descriptor.seed()
                 + " hash=" + state.layoutHash() + " blocks=" + plan.volume());
-        Bukkit.getScheduler().runTaskLater(plugin, () -> {
-            for (Chunk chunk : chunks) {
-                chunk.removePluginChunkTicket(plugin);
-            }
-        }, 40L);
+        releaseChunkTickets(chunks);
+        releaseBuildSlot(job);
+        if (GenerationRules.isSkullFloor(descriptor.floor())) {
+            Bukkit.getScheduler().runTask(plugin, this::endSkullSessionIfEmpty);
+        }
     }
 
     private void fillContainer(ChestSpec chest, FloorDescriptor descriptor) {
@@ -356,23 +530,29 @@ public final class FloorManager {
         }
     }
 
-    private void failGeneration(int floor, Throwable throwable) {
-        jobs.remove(floor);
+    private void failGeneration(GenerationJob job, Throwable throwable) {
+        int floor = job.descriptor.floor();
+        if (!jobs.remove(floor, job)) {
+            releaseBuildSlot(job);
+            return;
+        }
         plugin.getLogger().log(Level.SEVERE, "Failed to generate mine floor " + floor, throwable);
-        Set<UUID> queued = waitingPlayers.remove(floor);
-        if (queued != null) {
-            for (UUID uuid : queued) {
-                Player player = Bukkit.getPlayer(uuid);
-                if (player != null) {
-                    message(player, "Floor generation failed; check the server log.", NamedTextColor.RED);
-                }
+        Set<UUID> queued = pendingTargets.completeFloor(floor);
+        for (UUID uuid : queued) {
+            Player player = Bukkit.getPlayer(uuid);
+            if (player != null) {
+                message(player, "Floor generation failed; check the server log.", NamedTextColor.RED);
             }
         }
+        if (GenerationRules.isSkullFloor(floor)) {
+            Bukkit.getScheduler().runTask(plugin, this::endSkullSessionIfEmpty);
+        }
+        releaseBuildSlot(job);
     }
 
     private void teleportIntoFloor(Player player, FloorDescriptor descriptor) {
         if (!player.getWorld().equals(world)) {
-            returnLocations.put(player.getUniqueId(), player.getLocation().clone());
+            returnLocations.putIfAbsent(player.getUniqueId(), player.getLocation().clone());
         }
         Location target = descriptor.spawnPoint().center(world);
         target.setYaw(0.0f);
@@ -385,6 +565,7 @@ public final class FloorManager {
     }
 
     public void leave(Player player) {
+        pendingTargets.cancel(player.getUniqueId());
         Integer oldFloor = currentFloor(player);
         Location destination = returnLocations.remove(player.getUniqueId());
         if (destination == null || destination.getWorld() == null) {
@@ -397,12 +578,25 @@ public final class FloorManager {
         }
     }
 
+    public void handlePlayerQuit(Player player) {
+        pendingTargets.cancel(player.getUniqueId());
+    }
+
     public Integer currentFloor(Player player) {
+        // Physical membership stays valid until the player leaves or a rebuild
+        // explicitly evacuates the floor. A natural day rollover must not make
+        // an active miner lose ladder and block-break handling mid-session.
+        return locateFloor(player, false);
+    }
+
+    private Integer locateFloor(Player player, boolean requireCurrentGeneration) {
         if (!player.getWorld().equals(world)) return null;
         Integer stored = player.getPersistentDataContainer().get(floorKey, PersistentDataType.INTEGER);
         if (stored != null) {
             FloorState storedState = floorStore.get(stored);
-            if (storedState != null && storedState.descriptor().contains(
+            if (storedState != null
+                    && (!requireCurrentGeneration || isCurrentDescriptor(storedState.descriptor()))
+                    && storedState.descriptor().contains(
                     player.getLocation().getBlockX(),
                     player.getLocation().getBlockY(),
                     player.getLocation().getBlockZ()
@@ -412,7 +606,9 @@ public final class FloorManager {
         }
         int floor = (int) Math.round(player.getLocation().getZ() / settings.floorSpacing());
         FloorState state = floorStore.get(floor);
-        if (state != null && state.descriptor().contains(
+        if (state != null
+                && (!requireCurrentGeneration || isCurrentDescriptor(state.descriptor()))
+                && state.descriptor().contains(
                 player.getLocation().getBlockX(), player.getLocation().getBlockY(), player.getLocation().getBlockZ())) {
             return floor;
         }
@@ -421,10 +617,30 @@ public final class FloorManager {
 
     public void reconcilePlayerLocation(Player player) {
         Integer markedFloor = player.getPersistentDataContainer().get(floorKey, PersistentDataType.INTEGER);
+        if (player.getWorld().equals(world)) {
+            Integer locatedFloor = locateFloor(player, false);
+            if (locatedFloor != null) {
+                FloorState locatedState = floorStore.get(locatedFloor);
+                if (locatedState != null && !isCurrentDescriptor(locatedState.descriptor())) {
+                    enter(player, locatedFloor, true);
+                    return;
+                }
+            } else if (markedFloor != null
+                    && markedFloor >= 1
+                    && markedFloor <= 10000
+                    && floorStore.get(markedFloor) == null) {
+                if (evacuateForRegeneration(player, markedFloor)) {
+                    enter(player, markedFloor, true);
+                }
+                return;
+            }
+        }
         Integer actualFloor = currentFloor(player);
         if (actualFloor == null) {
             player.getPersistentDataContainer().remove(floorKey);
-            returnLocations.remove(player.getUniqueId());
+            if (!isWaiting(player.getUniqueId())) {
+                returnLocations.remove(player.getUniqueId());
+            }
         } else if (!actualFloor.equals(markedFloor)) {
             player.getPersistentDataContainer().set(floorKey, PersistentDataType.INTEGER, actualFloor);
         }
@@ -434,6 +650,10 @@ public final class FloorManager {
                 && (actualFloor == null || !GenerationRules.isSkullFloor(actualFloor))) {
             Bukkit.getScheduler().runTask(plugin, this::endSkullSessionIfEmpty);
         }
+    }
+
+    private boolean isWaiting(UUID uuid) {
+        return pendingTargets.contains(uuid);
     }
 
     public boolean handleStoneBreak(Player player, Block block) {
@@ -617,23 +837,45 @@ public final class FloorManager {
     }
 
     private BlockPoint findLadderSpot(FloorDescriptor descriptor, Location preferred) {
-        int startX = preferred.getWorld() != null && preferred.getWorld().equals(world)
-                ? preferred.getBlockX() : 0;
-        int startZ = preferred.getWorld() != null && preferred.getWorld().equals(world)
-                ? preferred.getBlockZ() : descriptor.centerZ();
-        int y = descriptor.baseY() + 2;
+        boolean preferredInTarget = preferred != null
+                && preferred.getWorld() != null
+                && preferred.getWorld().equals(world)
+                && descriptor.contains(preferred.getBlockX(), preferred.getBlockY(), preferred.getBlockZ());
+        BlockPoint fallback = descriptor.spawnPoint();
+        int startX = preferredInTarget ? preferred.getBlockX() : fallback.x();
+        int startZ = preferredInTarget ? preferred.getBlockZ() : fallback.z();
+        int minimumY = descriptor.baseY() + 1;
+        int maximumY = descriptor.baseY() + descriptor.height() - 3;
+        int startY = preferredInTarget ? preferred.getBlockY() : fallback.y();
+        int preferredY = Math.max(minimumY, Math.min(maximumY, startY));
         for (int radius = 2; radius <= 9; radius++) {
             for (int dx = -radius; dx <= radius; dx++) {
                 for (int dz = -radius; dz <= radius; dz++) {
                     if (Math.abs(dx) != radius && Math.abs(dz) != radius) continue;
-                    Block candidate = world.getBlockAt(startX + dx, y, startZ + dz);
-                    if (candidate.getType().isAir() && world.getBlockAt(startX + dx, y - 1, startZ + dz).getType().isSolid()) {
-                        return new BlockPoint(candidate.getX(), candidate.getY(), candidate.getZ());
+                    for (int offset = 0; offset <= maximumY - minimumY; offset++) {
+                        int upward = preferredY + offset;
+                        BlockPoint upwardSpot = standableSpot(startX + dx, upward, startZ + dz, minimumY, maximumY);
+                        if (upwardSpot != null) return upwardSpot;
+                        if (offset == 0) continue;
+                        int downward = preferredY - offset;
+                        BlockPoint downwardSpot = standableSpot(startX + dx, downward, startZ + dz, minimumY, maximumY);
+                        if (downwardSpot != null) return downwardSpot;
                     }
                 }
             }
         }
-        return new BlockPoint(2, y, descriptor.centerZ());
+        return descriptor.spawnPoint();
+    }
+
+    private BlockPoint standableSpot(int x, int y, int z, int minimumY, int maximumY) {
+        if (y < minimumY || y > maximumY) return null;
+        Block candidate = world.getBlockAt(x, y, z);
+        if (!candidate.getType().isAir()
+                || !world.getBlockAt(x, y - 1, z).getType().isSolid()
+                || !world.getBlockAt(x, y + 1, z).getType().isAir()) {
+            return null;
+        }
+        return new BlockPoint(x, y, z);
     }
 
     public void invalidate(int floor) {
@@ -655,6 +897,9 @@ public final class FloorManager {
                 .map(this::currentFloor)
                 .anyMatch(floor -> floor != null && GenerationRules.isSkullFloor(floor));
         if (anyInside) return;
+        boolean generationPending = jobs.keySet().stream().anyMatch(GenerationRules::isSkullFloor)
+                || pendingTargets.hasWaitingFloor(GenerationRules::isSkullFloor);
+        if (generationPending) return;
         long next = floorStore.nextSkullSession();
         for (Integer floor : new ArrayList<>(floorStore.all().keySet())) {
             if (GenerationRules.isSkullFloor(floor)) {
@@ -706,12 +951,86 @@ public final class FloorManager {
     }
 
     public void shutdown() {
+        pendingTargets.clear();
         floorStore.save();
         progressStore.save();
     }
 
     private void message(Player player, String text, NamedTextColor color) {
         player.sendMessage(Component.text(PREFIX + text, color));
+    }
+
+    static final class PendingTargets {
+        private final Map<UUID, Integer> byPlayer = new HashMap<>();
+        private final Map<Integer, Set<UUID>> byFloor = new HashMap<>();
+
+        void replace(UUID player, int floor) {
+            Integer previous = byPlayer.put(player, floor);
+            if (previous != null && previous != floor) {
+                removeFromFloor(player, previous);
+            }
+            byFloor.computeIfAbsent(floor, ignored -> new HashSet<>()).add(player);
+        }
+
+        void addIfAbsent(UUID player, int floor) {
+            Integer current = byPlayer.putIfAbsent(player, floor);
+            if (current == null || current == floor) {
+                byFloor.computeIfAbsent(floor, ignored -> new HashSet<>()).add(player);
+            }
+        }
+
+        void cancel(UUID player) {
+            Integer floor = byPlayer.remove(player);
+            if (floor != null) {
+                removeFromFloor(player, floor);
+            }
+        }
+
+        Set<UUID> waitingFor(int floor) {
+            Set<UUID> waiting = byFloor.get(floor);
+            return waiting == null ? Set.of() : Set.copyOf(waiting);
+        }
+
+        Set<UUID> completeFloor(int floor) {
+            Set<UUID> waiting = byFloor.remove(floor);
+            if (waiting == null || waiting.isEmpty()) {
+                return Set.of();
+            }
+            Set<UUID> completed = new HashSet<>();
+            for (UUID player : waiting) {
+                if (byPlayer.remove(player, floor)) {
+                    completed.add(player);
+                }
+            }
+            return Set.copyOf(completed);
+        }
+
+        boolean contains(UUID player) {
+            return byPlayer.containsKey(player);
+        }
+
+        boolean hasWaitingFloor(java.util.function.IntPredicate predicate) {
+            for (Map.Entry<Integer, Set<UUID>> entry : byFloor.entrySet()) {
+                if (!entry.getValue().isEmpty() && predicate.test(entry.getKey())) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        void clear() {
+            byPlayer.clear();
+            byFloor.clear();
+        }
+
+        private void removeFromFloor(UUID player, int floor) {
+            Set<UUID> waiting = byFloor.get(floor);
+            if (waiting == null) return;
+            waiting.remove(player);
+            if (waiting.isEmpty()) {
+                byFloor.remove(floor);
+            }
+        }
     }
 
     private record BlockKey(int x, int y, int z) {
@@ -727,6 +1046,9 @@ public final class FloorManager {
     private record LadderTarget(int sourceFloor, int destinationFloor, boolean shaft, int jump) {
     }
 
+    private record PreparedPlan(GenerationJob job, FloorPlan plan) {
+    }
+
     private static final class GenerationJob {
         private final FloorDescriptor descriptor;
         private JobStage stage;
@@ -739,6 +1061,7 @@ public final class FloorManager {
 
     private enum JobStage {
         PLANNING,
+        QUEUED,
         LOADING,
         BUILDING
     }

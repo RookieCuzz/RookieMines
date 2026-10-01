@@ -3,7 +3,7 @@ package dev.rookiemines.mine;
 import java.util.Set;
 
 public final class GenerationRules {
-    public static final int GENERATION_VERSION = 1;
+    public static final int GENERATION_VERSION = 2;
     public static final int SKULL_LOBBY_FLOOR = 121;
     public static final int FIRST_SKULL_FLOOR = 122;
     private static final Set<Integer> REWARD_FLOORS = Set.of(

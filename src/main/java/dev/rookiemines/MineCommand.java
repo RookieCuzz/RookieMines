@@ -18,10 +18,12 @@ import java.util.Locale;
 public final class MineCommand implements CommandExecutor, TabCompleter {
     private final RookieMinesPlugin plugin;
     private final FloorManager floors;
+    private final ElevatorMenu elevatorMenu;
 
-    public MineCommand(RookieMinesPlugin plugin, FloorManager floors) {
+    public MineCommand(RookieMinesPlugin plugin, FloorManager floors, ElevatorMenu elevatorMenu) {
         this.plugin = plugin;
         this.floors = floors;
+        this.elevatorMenu = elevatorMenu;
     }
 
     @Override
@@ -53,7 +55,7 @@ public final class MineCommand implements CommandExecutor, TabCompleter {
             case "status" -> sendMachine(player, args.length >= 2 ? args[1] : null, floors.statusJson(player));
             case "elevator" -> {
                 if (args.length < 2) {
-                    player.sendMessage(Component.text("Deepest unlocked elevator: " + floors.deepestElevator(player), NamedTextColor.YELLOW));
+                    elevatorMenu.open(player);
                     return true;
                 }
                 Integer floor = parseFloor(player, args[1]);
@@ -154,7 +156,7 @@ public final class MineCommand implements CommandExecutor, TabCompleter {
     }
 
     private void help(Player player) {
-        player.sendMessage(Component.text("/rmine enter [floor] | leave | status | elevator <floor> | skull", NamedTextColor.AQUA));
+        player.sendMessage(Component.text("/rmine enter [floor] | leave | status | elevator [floor] | skull", NamedTextColor.AQUA));
     }
 
     @Override
@@ -169,6 +171,13 @@ public final class MineCommand implements CommandExecutor, TabCompleter {
         }
         if (args.length == 2 && args[0].equalsIgnoreCase("admin")) {
             return filter(List.of("day", "goto", "regenerate", "force-ladder", "describe", "fixture"), args[1]);
+        }
+        if (args.length == 2 && args[0].equalsIgnoreCase("elevator") && sender instanceof Player player) {
+            List<String> floors = ElevatorMenu.destinationsFor(this.floors.deepestElevator(player))
+                    .stream()
+                    .map(String::valueOf)
+                    .toList();
+            return filter(floors, args[1]);
         }
         return List.of();
     }

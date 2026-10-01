@@ -11,6 +11,7 @@ import org.bukkit.plugin.java.JavaPlugin;
 
 public final class RookieMinesPlugin extends JavaPlugin {
     private FloorManager floorManager;
+    private ElevatorMenu elevatorMenu;
 
     @Override
     public void onEnable() {
@@ -38,19 +39,23 @@ public final class RookieMinesPlugin extends JavaPlugin {
         }
 
         floorManager = new FloorManager(this, mineWorld, settings, floorStore, progressStore);
-        MineCommand commandHandler = new MineCommand(this, floorManager);
+        elevatorMenu = new ElevatorMenu(this, floorManager);
+        MineCommand commandHandler = new MineCommand(this, floorManager, elevatorMenu);
         PluginCommand mineCommand = getCommand("rmine");
         if (mineCommand == null) {
             throw new IllegalStateException("plugin.yml did not register /rmine");
         }
         mineCommand.setExecutor(commandHandler);
         mineCommand.setTabCompleter(commandHandler);
-        getServer().getPluginManager().registerEvents(new MineListener(this, floorManager), this);
+        getServer().getPluginManager().registerEvents(new MineListener(this, floorManager, elevatorMenu), this);
         getLogger().info("RookieMines (菜鸟矿洞) enabled for Paper 1.21.4; world=" + mineWorld.getName());
     }
 
     @Override
     public void onDisable() {
+        if (elevatorMenu != null) {
+            elevatorMenu.shutdown();
+        }
         if (floorManager != null) {
             floorManager.shutdown();
         }
@@ -73,7 +78,13 @@ public final class RookieMinesPlugin extends JavaPlugin {
                 getConfig().getInt("generation.max-monsters", 24),
                 getConfig().getBoolean("generation.generate-monsters", true),
                 getConfig().getDouble("generation.fishing-pool-chance", 0.35),
-                getConfig().getDouble("generation.special-room-chance", 0.28)
+                getConfig().getDouble("generation.special-room-chance", 0.28),
+                getConfig().getInt("generation.floor-variation", 2),
+                getConfig().getInt("generation.ceiling-variation", 3),
+                getConfig().getDouble("generation.wall-roughness", 0.42),
+                getConfig().getDouble("generation.formation-density", 0.018),
+                getConfig().getDouble("generation.earth-cobweb-density", 0.0015),
+                getConfig().getDouble("generation.skull-cobweb-density", 0.008)
         );
     }
 }

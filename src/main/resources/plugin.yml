@@ -6,7 +6,7 @@ prefix: 菜鸟矿洞
 description: 菜鸟矿洞：每日随机生成的农场 RPG 风格矿洞。
 commands:
   rmine:
-    description: Enter and manage the procedural mines.
+    description: Enter the procedural mines and use the in-mine elevator GUI.
     usage: /rmine <enter|leave|status|elevator|skull|admin>
     aliases: [rookiemine]
 permissions:
