@@ -10,7 +10,7 @@
     "node": ">=22"
   },
   "devDependencies": {
-    "mineflayer": "4.38.0",
+    "mineflayer": "4.39.0",
     "vec3": "0.1.10"
   }
 }
